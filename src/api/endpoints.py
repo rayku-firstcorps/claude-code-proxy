@@ -8,10 +8,12 @@ from src.core.config import config
 from src.core.logging import logger
 from src.core.client import OpenAIClient
 from src.models.claude import ClaudeMessagesRequest, ClaudeTokenCountRequest
-from src.conversion.request_converter import convert_claude_to_openai
+from src.conversion.request_converter import convert_claude_to_openai, convert_claude_to_responses
 from src.conversion.response_converter import (
     convert_openai_to_claude_response,
     convert_openai_streaming_to_claude_with_cancellation,
+    convert_responses_to_claude_response,
+    convert_responses_streaming_to_claude_with_cancellation,
 )
 from src.core.model_manager import model_manager
 
@@ -26,6 +28,8 @@ openai_client = OpenAIClient(
     config.request_timeout,
     api_version=config.azure_api_version,
     custom_headers=custom_headers,
+    stream_accept_header=config.stream_accept_header,
+    user_agent=config.user_agent,
 )
 
 async def validate_api_key(x_api_key: Optional[str] = Header(None), authorization: Optional[str] = Header(None)):
@@ -60,8 +64,12 @@ async def create_message(request: ClaudeMessagesRequest, http_request: Request, 
         # Generate unique request ID for cancellation tracking
         request_id = str(uuid.uuid4())
 
-        # Convert Claude request to OpenAI format
-        openai_request = convert_claude_to_openai(request, model_manager)
+        # Convert Claude request to the configured OpenAI-compatible format
+        openai_request = (
+            convert_claude_to_responses(request, model_manager)
+            if config.use_responses_api
+            else convert_claude_to_openai(request, model_manager)
+        )
 
         # Check if client disconnected before processing
         if await http_request.is_disconnected():
@@ -70,11 +78,20 @@ async def create_message(request: ClaudeMessagesRequest, http_request: Request, 
         if request.stream:
             # Streaming response - wrap in error handling
             try:
-                openai_stream = openai_client.create_chat_completion_stream(
-                    openai_request, request_id
+                openai_stream = (
+                    openai_client.create_response_stream(openai_request, request_id)
+                    if config.use_responses_api
+                    else openai_client.create_chat_completion_stream(
+                        openai_request, request_id
+                    )
+                )
+                stream_converter = (
+                    convert_responses_streaming_to_claude_with_cancellation
+                    if config.use_responses_api
+                    else convert_openai_streaming_to_claude_with_cancellation
                 )
                 return StreamingResponse(
-                    convert_openai_streaming_to_claude_with_cancellation(
+                    stream_converter(
                         openai_stream,
                         request,
                         logger,
@@ -104,11 +121,15 @@ async def create_message(request: ClaudeMessagesRequest, http_request: Request, 
                 return JSONResponse(status_code=e.status_code, content=error_response)
         else:
             # Non-streaming response
-            openai_response = await openai_client.create_chat_completion(
-                openai_request, request_id
+            openai_response = (
+                await openai_client.create_response(openai_request, request_id)
+                if config.use_responses_api
+                else await openai_client.create_chat_completion(openai_request, request_id)
             )
-            claude_response = convert_openai_to_claude_response(
-                openai_response, request
+            claude_response = (
+                convert_responses_to_claude_response(openai_response, request)
+                if config.use_responses_api
+                else convert_openai_to_claude_response(openai_response, request)
             )
             return claude_response
     except HTTPException:
@@ -177,13 +198,25 @@ async def test_connection():
     """Test API connectivity to OpenAI"""
     try:
         # Simple test request to verify API connectivity
-        test_response = await openai_client.create_chat_completion(
-            {
-                "model": config.small_model,
-                "messages": [{"role": "user", "content": "Hello"}],
-                "max_tokens": 5,
-            }
-        )
+        if config.use_responses_api:
+            test_response = await openai_client.create_response(
+                {
+                    "model": config.small_model,
+                    "input": [{"role": "user", "content": "Hello"}],
+                    "max_output_tokens": 5,
+                    "reasoning": {"effort": config.reasoning_effort}
+                    if config.reasoning_effort
+                    else None,
+                }
+            )
+        else:
+            test_response = await openai_client.create_chat_completion(
+                {
+                    "model": config.small_model,
+                    "messages": [{"role": "user", "content": "Hello"}],
+                    "max_tokens": 5,
+                }
+            )
 
         return {
             "status": "success",
@@ -222,6 +255,8 @@ async def root():
             "max_tokens_limit": config.max_tokens_limit,
             "api_key_configured": bool(config.openai_api_key),
             "client_api_key_validation": bool(config.anthropic_api_key),
+            "use_responses_api": config.use_responses_api,
+            "reasoning_effort": config.reasoning_effort,
             "big_model": config.big_model,
             "small_model": config.small_model,
         },

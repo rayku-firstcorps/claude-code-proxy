@@ -1,4 +1,5 @@
 import json
+import uuid
 from typing import Dict, Any, List
 from venv import logger
 from src.core.constants import Constants
@@ -47,7 +48,11 @@ def convert_claude_to_openai(
     while i < len(claude_request.messages):
         msg = claude_request.messages[i]
 
-        if msg.role == Constants.ROLE_USER:
+        if msg.role == Constants.ROLE_SYSTEM:
+            openai_message = convert_claude_system_message(msg)
+            if openai_message["content"]:
+                openai_messages.append(openai_message)
+        elif msg.role == Constants.ROLE_USER:
             openai_message = convert_claude_user_message(msg)
             openai_messages.append(openai_message)
         elif msg.role == Constants.ROLE_ASSISTANT:
@@ -127,6 +132,164 @@ def convert_claude_to_openai(
             openai_request["tool_choice"] = "auto"
 
     return openai_request
+
+
+def convert_claude_to_responses(
+    claude_request: ClaudeMessagesRequest, model_manager
+) -> Dict[str, Any]:
+    """Convert Claude API request format to OpenAI Responses API format."""
+    chat_request = convert_claude_to_openai(claude_request, model_manager)
+
+    responses_request = {
+        "model": chat_request["model"],
+        "input": convert_chat_messages_to_responses_input(chat_request["messages"]),
+        "max_output_tokens": chat_request["max_tokens"],
+    }
+
+    if claude_request.stream:
+        responses_request["stream"] = True
+    if claude_request.temperature is not None:
+        responses_request["temperature"] = claude_request.temperature
+    if claude_request.top_p is not None:
+        responses_request["top_p"] = claude_request.top_p
+
+    reasoning = {}
+    reasoning_effort = model_manager.get_reasoning_effort_for_model(claude_request.model)
+    if reasoning_effort:
+        reasoning["effort"] = reasoning_effort
+    if config.reasoning_summary:
+        reasoning["summary"] = config.reasoning_summary
+    if reasoning:
+        responses_request["reasoning"] = reasoning
+
+    if "tools" in chat_request:
+        responses_request["tools"] = [
+            {
+                "type": Constants.TOOL_FUNCTION,
+                "name": tool[Constants.TOOL_FUNCTION]["name"],
+                "description": tool[Constants.TOOL_FUNCTION].get("description", ""),
+                "parameters": tool[Constants.TOOL_FUNCTION].get("parameters", {}),
+                "strict": False,
+            }
+            for tool in chat_request["tools"]
+        ]
+
+    if "tool_choice" in chat_request:
+        responses_request["tool_choice"] = convert_chat_tool_choice_to_responses(
+            chat_request["tool_choice"]
+        )
+
+    logger.debug(
+        f"Converted Claude request to Responses API format: {json.dumps(responses_request, indent=2, ensure_ascii=False)}"
+    )
+    return responses_request
+
+
+def convert_chat_messages_to_responses_input(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    responses_input = []
+
+    for message in messages:
+        role = message.get("role")
+
+        if role == Constants.ROLE_TOOL:
+            responses_input.append(
+                {
+                    "type": "function_call_output",
+                    "call_id": message.get("tool_call_id", ""),
+                    "output": message.get("content", ""),
+                    "status": "completed",
+                }
+            )
+            continue
+
+        if role == Constants.ROLE_ASSISTANT and message.get("tool_calls"):
+            content = message.get("content")
+            if content:
+                responses_input.append(
+                    {
+                        "type": "message",
+                        "id": f"msg_{uuid.uuid4().hex}",
+                        "role": Constants.ROLE_ASSISTANT,
+                        "status": "completed",
+                        "content": [
+                            {
+                                "type": "output_text",
+                                "text": content,
+                                "annotations": [],
+                            }
+                        ],
+                    }
+                )
+
+            for tool_call in message["tool_calls"]:
+                function_data = tool_call.get(Constants.TOOL_FUNCTION, {})
+                responses_input.append(
+                    {
+                        "type": "function_call",
+                        "call_id": tool_call.get("id", f"call_{uuid.uuid4().hex}"),
+                        "name": function_data.get("name", ""),
+                        "arguments": function_data.get("arguments", "{}"),
+                        "status": "completed",
+                    }
+                )
+            continue
+
+        content = message.get("content", "")
+        if isinstance(content, list):
+            content = convert_chat_content_to_responses_content(content)
+
+        responses_input.append(
+            {
+                "type": "message",
+                "role": role,
+                "content": content,
+            }
+        )
+
+    return responses_input
+
+
+def convert_chat_content_to_responses_content(content: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    responses_content = []
+
+    for item in content:
+        if item.get("type") == "text":
+            responses_content.append({"type": "input_text", "text": item.get("text", "")})
+        elif item.get("type") == "image_url":
+            image_url = item.get("image_url", {}).get("url")
+            if image_url:
+                responses_content.append(
+                    {"type": "input_image", "image_url": image_url, "detail": "auto"}
+                )
+
+    return responses_content
+
+
+def convert_chat_tool_choice_to_responses(tool_choice):
+    if isinstance(tool_choice, str):
+        return "required" if tool_choice == "required" else tool_choice
+
+    if isinstance(tool_choice, dict) and tool_choice.get("type") == Constants.TOOL_FUNCTION:
+        function_data = tool_choice.get(Constants.TOOL_FUNCTION, {})
+        return {"type": Constants.TOOL_FUNCTION, "name": function_data.get("name", "")}
+
+    return "auto"
+
+
+def convert_claude_system_message(msg: ClaudeMessage) -> Dict[str, Any]:
+    """Convert Claude system message to OpenAI format."""
+    if msg.content is None:
+        return {"role": Constants.ROLE_SYSTEM, "content": ""}
+
+    if isinstance(msg.content, str):
+        return {"role": Constants.ROLE_SYSTEM, "content": msg.content}
+
+    text_parts = []
+    for block in msg.content:
+        if block.type == Constants.CONTENT_TEXT:
+            text_parts.append(block.text)
+
+    return {"role": Constants.ROLE_SYSTEM, "content": "\n\n".join(text_parts).strip()}
 
 
 def convert_claude_user_message(msg: ClaudeMessage) -> Dict[str, Any]:
